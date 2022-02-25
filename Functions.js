@@ -60,6 +60,7 @@ exports.get_corrected_elevation_DEM=function(ic,sed_thislake,options){
       dem_edge=dem_edge.updateMask(slope_filled.abs().lt(0.01));
     }
     var dem_elevation = 
+    //Ignore pixels adjaccent to vegetation. Water detection currently can't handle floating vegetation/inundated vegetation.
       ee.Number(dem_edge.updateMask(veg_edge.neq(1)).reduceRegion({
         reducer: 'median',
         geometry: bounds,
@@ -118,14 +119,12 @@ exports.getannual_deltah=function(daily_deltah,start_date,end_date){
   var annual_deltah=ee.ImageCollection(ee.List.sequence(ee.Number(start_year).add(1), end_year).map(function(year) {
     var col=daily_deltah.filterDate(ee.Date.fromYMD(ee.Number(year).subtract(1),start_month,start_day), ee.Date.fromYMD(ee.Number(year),start_month,start_day));
     var col_mean=col.reduce(ee.Reducer.mean()).rename('sed_diff')
-      .set('system:time_start',ee.Date.fromYMD(ee.Number(year), 1, 1))    
-      // Add a time band. 
-      .addBands(ee.Image(ee.Number(year).subtract(ee.Number(start_year).add(1))).rename('t').float());
+      .set('system:time_start',ee.Date.fromYMD(ee.Number(year), 1, 1));
     return col_mean.set('count',col.size()).set('delta_t',ee.Number(year).subtract(ee.Number(start_year).add(1)));
   })).filter(ee.Filter.gt('count', 0));
 
   //stacking is useful for exporting (keep only one image with one band per year)
-  var stack = ee.Image(annual_deltah.iterate(function(img, prev) {
+  var stack = ee.Image(annual_deltah.select('sed_diff').iterate(function(img, prev) {
     return ee.Image(prev).addBands(img.rename(ee.String('t').cat(ee.String(ee.Number(ee.Image(img).get('delta_t')).int()))));
   }, ee.Image(1))).slice(1);
   return stack;
@@ -154,13 +153,14 @@ exports.stacktoimage=function(img){
     var nr=ee.Number.parse(ee.String(b).slice(1));
     return ee.Image(img).select(ee.String(b)).rename('b1').set('t',nr);
   }));
-  //number of values from 2000 to 2010
+  //Count the number of available annual SEAs per pixel (2000-2021)
   var count2=sed_zone_collection.filter(ee.Filter.lte('t', 10)).count().rename('count');
-  //how about 2011-2020? find those pixels with relevant slope that were not representing water edge before 2011!!
+  slope=slope.updateMask(count.gte(6)).updateMask(count2.gt(1));
+  
+  //Count the number of available annual SEAs per pixel (recent years; 2011-present)
   var count3=sed_zone_collection.filter(ee.Filter.gt('t', 10)).count().rename('count');
   count3=count3.where(count2.gte(2),0);
- 
-  slope=slope.updateMask(count.gte(6)).updateMask(count2.gt(1));
+  //calculate also the slope of those pixels which represented water edge mainly in recent years
   var slope11to20=im_reduced_sens.select('slope').updateMask(count3.gte(5));
 
   var sedzones_tmp=slope.where(im_reduced_sens.select('p-value').gt(0.1),0);
@@ -172,7 +172,7 @@ exports.stacktoimage=function(img){
     .blend(
       im_reduced_sens.select('slope').updateMask(count.gte(6))//wo smoothing
     )
-    //count.gte(3): shoreline pixels that only occur up to three times in 21 years wont be masked out
+    //pixels that represent the shorelines only in less than 3 out of 22 years will be masked
     .updateMask(count.gte(3)).reproject({crs: count.projection().crs(), scale:10}).rename('sedzone_filled');  
   return im_reduced_sens.addBands(sedzone_filled).copyProperties(ee.Image(img));
 };
@@ -208,7 +208,6 @@ exports.get_landsat_images=function(aoi,displacement_L5,displacement_L7,displace
   //due to coregistration nodata fraction might increase - recalculate
   withMNDWI_l8=withMNDWI_l8.map(function(img){ return morefunctions.cloudscore_L8_pro(ee.Image(img),aoi)})
     .filter(ee.Filter.lt('nodata_cover', nodata_thresh));
-
 
   ////////NOW LANDSAT 7//////////////
   var l7 = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR').filterBounds(aoi)
@@ -268,38 +267,45 @@ exports.get_landsat_images=function(aoi,displacement_L5,displacement_L7,displace
 exports.coreg_getdisplacement = function(date,sat,img,bounds){
   bounds=ee.Geometry(bounds);
   date=ee.Date(date);
+  var sensor_name=ee.String(sat);
   var imgS2=ee.Image(img);
-  var bandIn = ['B2','B3','B4','B5','B6','B7'];
+  var bandIn_l8 = ['B2','B3','B4','B5','B6','B7'];
   var bandIn_l7 = ['B1','B2','B3','B4','B5','B7'];
   var bandIn_s2 = ['B2','B3','B4','B8','B11','B12'];
   var bandOut = ['blue','green','red','nir','swir1','swir2'];
-
+  var sensor_list= ee.List(['LANDSAT_5','LANDSAT_7','LANDSAT_8']);
   var proj=imgS2.select('green').projection();
+
+  var imgL5col = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR').filterBounds(bounds)
+         .filterDate(date,date.advance(1,'day')).select(bandIn_l7,bandOut);
+  var imgl5a=ee.Image(imgL5col.mosaic().copyProperties(imgL5col.first()).set('system:time_start',imgL5col.first().get('system:time_start')))
+    .clip(bounds).setDefaultProjection(proj);
+  var imgl5b=imgL5col.first();
+  var imgL5= ee.Image(ee.Algorithms.If(imgL5col.size().gt(1),imgl5a,imgl5b));
+
   var imgL7col = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR').filterBounds(bounds)
-         .filterDate(date,date.advance(1,'day')).select(bandIn_l7,bandOut);//.clip(bound);
+         .filterDate(date,date.advance(1,'day')).select(bandIn_l7,bandOut);
   var imgL7a=ee.Image(imgL7col.mosaic().copyProperties(imgL7col.first()).set('system:time_start',imgL7col.first().get('system:time_start')))
-    .clip(bounds.buffer(10000,100)).setDefaultProjection(proj);
+    .clip(bounds).setDefaultProjection(proj);
   var imgL7b=imgL7col.first();
   var imgL7= ee.Image(ee.Algorithms.If(imgL7col.size().gt(1),imgL7a,imgL7b));
   
   var imgL8col = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR').filterBounds(bounds)
-         .filterDate(date,date.advance(1,'day')).select(bandIn,bandOut);//.clip(bound);
+         .filterDate(date,date.advance(1,'day')).select(bandIn_l8,bandOut);
   var imgL8a=ee.Image(imgL8col.mosaic().copyProperties(imgL8col.first()).set('system:time_start',imgL8col.first().get('system:time_start')))
-    .clip(bounds.buffer(10000,100)).setDefaultProjection(proj);
+    .clip(bounds).setDefaultProjection(proj);
   var imgL8b=imgL8col.first();
   var imgL8= ee.Image(ee.Algorithms.If(imgL8col.size().gt(1),imgL8a,imgL8b));
   
-  var imgL =ee.Image(ee.Algorithms.If(ee.String(sat).compareTo('LANDSAT_7').eq(0),imgL7,imgL8));
+  var imgL=ee.Image(ee.List([imgL5,imgL7,imgL8]).get(sensor_list.indexOf(sensor_name)));
+  
   var LRedBand = imgL.select('green');
   var S2RedBand = imgS2.select('green');
 
   var displacement = LRedBand.displacement({
     referenceImage: S2RedBand,
     maxOffset: 50.0,//The maximum offset allowed when attempting to align the input images, in meters
-    projection: proj,
-    //stiffness: 5,
     patchWidth: 100 // Small enough to capture texture and large enough that ignorable 
-    //objects are small within the patch. Automatically ditermined if not provided 
-  });//.reproject(LProjection.crs(), null, 30);
+  }).reproject(ee.Projection('EPSG:4326'), null, 30);
   return displacement;
 };
